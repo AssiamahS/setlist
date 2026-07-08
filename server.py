@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""Setlist — drop a 1001tracklists URL, get every track the DJ played,
+download them through the amapiano library server.
+
+1001tracklists sits behind Cloudflare Turnstile, so live fetches usually fail.
+Resolution order per URL:
+  1. direct fetch (works if Cloudflare ever lets us through)
+  2. Wayback Machine latest snapshot (1001tracklists is heavily archived)
+  3. manual: paste the page / bookmarklet ingest
+
+Downloads are delegated to the amapiano server (localhost:8766) so tracks land
+in the same library, Serato crates and rekordbox XML as everything else.
+"""
+
+import hashlib
+import html as htmllib
+import json
+import re
+import subprocess
+import threading
+import time
+import urllib.parse
+import urllib.request
+from difflib import SequenceMatcher
+from pathlib import Path
+
+from flask import Flask, jsonify, request, send_from_directory
+
+PORT = 8787
+AMAPIANO = "http://localhost:8766"
+BASE = Path(__file__).parent
+CACHE_DIR = BASE / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
+UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+      "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+
+# Same Spotify app spotdl uses — read live config first, fall back to known pair
+SPOTDL_CONFIG = Path.home() / ".spotdl" / "config.json"
+SPOTIFY_ID = "5f573c9620494bae87890c0f08a60293"
+SPOTIFY_SECRET = "212476d9b0f3472eaa762d90b19b0ba8"
+try:
+    _cfg = json.load(open(SPOTDL_CONFIG))
+    SPOTIFY_ID = _cfg.get("client_id") or SPOTIFY_ID
+    SPOTIFY_SECRET = _cfg.get("client_secret") or SPOTIFY_SECRET
+except Exception:
+    pass
+
+app = Flask(__name__)
+
+
+@app.after_request
+def cors(resp):
+    # bookmarklet POSTs from www.1001tracklists.com
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return resp
+
+
+# ── HTTP helpers ──
+
+def http_get(url, timeout=30, headers=None):
+    h = {"User-Agent": UA, "Accept-Language": "en-US,en;q=0.9"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, headers=h)
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.read().decode("utf-8", errors="replace")
+
+
+def http_get_json(url, timeout=30, headers=None):
+    return json.loads(http_get(url, timeout=timeout, headers=headers))
+
+
+def cache_get(key, max_age=None):
+    p = CACHE_DIR / f"{hashlib.md5(key.encode()).hexdigest()}.json"
+    if not p.exists():
+        return None
+    if max_age and time.time() - p.stat().st_mtime > max_age:
+        return None
+    try:
+        return json.load(open(p))
+    except Exception:
+        return None
+
+
+def cache_put(key, value):
+    p = CACHE_DIR / f"{hashlib.md5(key.encode()).hexdigest()}.json"
+    json.dump(value, open(p, "w"))
+
+
+# ── 1001tracklists fetching ──
+
+CHALLENGE_MARKER = "challenges.cloudflare.com/turnstile"
+
+
+def is_challenge(html):
+    return CHALLENGE_MARKER in html or "you will be forwarded" in html
+
+
+def fetch_direct(url):
+    try:
+        html = http_get(url, timeout=20)
+        if not is_challenge(html):
+            return html, "live"
+    except Exception:
+        pass
+    return None, None
+
+
+def wayback_latest(url):
+    """Latest Wayback snapshot timestamp for a URL, or None."""
+    q = urllib.parse.quote(url, safe="")
+    try:
+        data = http_get_json(
+            f"https://archive.org/wayback/available?url={q}&timestamp=99999999999999",
+            timeout=30)
+        snap = data.get("archived_snapshots", {}).get("closest")
+        if snap and snap.get("available"):
+            return snap["timestamp"]
+    except Exception:
+        pass
+    return None
+
+
+def fetch_wayback(url):
+    ts = wayback_latest(url)
+    if not ts:
+        return None, None
+    try:
+        # id_ = original bytes, no wayback toolbar injected
+        html = http_get(f"https://web.archive.org/web/{ts}id_/{url}", timeout=60)
+        return html, f"wayback {ts[:4]}-{ts[4:6]}-{ts[6:8]}"
+    except Exception:
+        return None, None
+
+
+def fetch_page(url):
+    """Fetch a 1001tracklists page: live first, Wayback fallback. Cached."""
+    cached = cache_get("page:" + url, max_age=6 * 3600)
+    if cached:
+        return cached["html"], cached["source"]
+    html, source = fetch_direct(url)
+    if not html:
+        html, source = fetch_wayback(url)
+    if html:
+        cache_put("page:" + url, {"html": html, "source": source})
+    return html, source
+
+
+# ── parsing ──
+
+TRACK_RE = re.compile(
+    r'itemtype="https?://schema\.org/MusicRecording">\s*'
+    r'<meta itemprop="name" content="([^"]+)"')
+TL_URL_RE = re.compile(
+    r'1001tracklists\.com/tracklist/([a-z0-9]+)/([a-z0-9\-]+)\.html', re.I)
+DJ_URL_RE = re.compile(r'1001tracklists\.com/dj/([a-z0-9\-]+)', re.I)
+
+
+def parse_tracks(html):
+    """Ordered unique track names from schema.org markup, split into artist/title."""
+    seen, tracks = set(), []
+    for raw in TRACK_RE.findall(html):
+        name = htmllib.unescape(raw).strip()
+        key = name.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        tracks.append(make_track(name, len(tracks) + 1))
+    return tracks
+
+
+def make_track(name, n):
+    artist, _, title = name.partition(" - ")
+    if not title:
+        artist, title = "", name
+    artist, title = artist.strip(), title.strip()
+    # "ID - ID", "Artist - ID", "ID - Title": unidentified — nothing to search for
+    is_id = artist.upper() == "ID" or title.upper() == "ID"
+    return {"n": n, "name": name, "artist": artist, "title": title, "unknown": is_id}
+
+
+def parse_set_title(html):
+    m = re.search(r'<meta property="og:title" content="([^"]+)"', html)
+    if m:
+        t = htmllib.unescape(m.group(1))
+        if "1001Tracklists" not in t:
+            return t
+    m = re.search(r'itemtype="https?://schema\.org/MusicPlaylist"[^>]*>\s*'
+                  r'<meta itemprop="name" content="([^"]+)"', html)
+    if m:
+        return htmllib.unescape(m.group(1))
+    m = re.search(r"<title>(.*?)</title>", html, re.S)
+    return htmllib.unescape(m.group(1)).strip() if m else "Tracklist"
+
+
+def parse_tracklist_links(html):
+    """(url, slug) pairs for every tracklist link in a page."""
+    out, seen = [], set()
+    for m in re.finditer(r'href="(?:https?://(?:www\.)?1001tracklists\.com)?'
+                         r'(/tracklist/([a-z0-9]+)/([a-z0-9\-]+)\.html)"', html, re.I):
+        path, tlid, slug = m.groups()
+        if tlid in seen:
+            continue
+        seen.add(tlid)
+        out.append({"url": "https://www.1001tracklists.com" + path, "slug": slug})
+    return out
+
+
+def slug_to_title(slug):
+    parts = slug.rsplit("-", 3)
+    date = ""
+    if len(parts) == 4 and all(p.isdigit() for p in parts[1:]):
+        date = "-".join(parts[1:])
+        slug = parts[0]
+    return slug.replace("-", " ").title(), date
+
+
+# ── DJ set discovery: DuckDuckGo (fresh) + archived DJ page (history) ──
+
+def ddg_sets_for(dj_name):
+    """Recent tracklist URLs for a DJ from DuckDuckGo's HTML endpoint."""
+    cached = cache_get("ddg:" + dj_name.lower(), max_age=24 * 3600)
+    if cached is not None:
+        return cached
+    sets, seen = [], set()
+    for offset in (0, 30):
+        q = urllib.parse.urlencode({
+            "q": f'site:1001tracklists.com/tracklist "{dj_name}"', "s": offset})
+        try:
+            page = http_get(f"https://html.duckduckgo.com/html/?{q}", timeout=30)
+        except Exception as e:
+            print(f"[ddg] search failed: {e}", flush=True)
+            break
+        # results come both uddg-urlencoded and plain
+        for chunk in (urllib.parse.unquote(page), page):
+            for m in TL_URL_RE.finditer(chunk):
+                tlid, slug = m.groups()
+                if tlid in seen:
+                    continue
+                seen.add(tlid)
+                title, date = slug_to_title(slug)
+                sets.append({
+                    "url": f"https://www.1001tracklists.com/tracklist/{tlid}/{slug}.html",
+                    "id": tlid, "title": title, "date": date, "archived": "",
+                })
+        if "result__a" not in page:  # no (more) results
+            break
+        time.sleep(1)
+    cache_put("ddg:" + dj_name.lower(), sets)
+    return sets
+
+
+def dj_display_name(dj_slug):
+    """DJ display name from their (possibly old) archived DJ page title."""
+    html, _ = fetch_page(f"https://www.1001tracklists.com/dj/{dj_slug}/index.html")
+    if html:
+        m = re.search(r"<title>([^<]+?)\s*(?:Tracklists|&sdot;|⋅)", html)
+        if m and "1001Tracklists" not in m.group(1):
+            return m.group(1).strip()
+    return dj_slug.replace("-", " ").title()
+
+
+# ── Spotify matching ──
+
+_sp_token = {"token": None, "expires": 0}
+_sp_lock = threading.Lock()
+
+
+def spotify_token():
+    with _sp_lock:
+        if _sp_token["token"] and time.time() < _sp_token["expires"]:
+            return _sp_token["token"]
+        import base64
+        auth = base64.b64encode(f"{SPOTIFY_ID}:{SPOTIFY_SECRET}".encode()).decode()
+        req = urllib.request.Request(
+            "https://accounts.spotify.com/api/token",
+            data=b"grant_type=client_credentials",
+            headers={"Authorization": f"Basic {auth}",
+                     "Content-Type": "application/x-www-form-urlencoded"})
+        resp = json.loads(urllib.request.urlopen(req, timeout=15).read())
+        _sp_token["token"] = resp["access_token"]
+        _sp_token["expires"] = time.time() + resp["expires_in"] - 60
+        return _sp_token["token"]
+
+
+def norm(s):
+    s = re.sub(r"\(.*?\)|\[.*?\]", " ", s.lower())
+    s = re.sub(r"\b(ft|feat|featuring|vs|&|x|and|with)\b\.?", " ", s)
+    return re.sub(r"[^a-z0-9]+", " ", s).strip()
+
+
+def similarity(a, b):
+    return SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+MATCH_THRESHOLD = 0.55
+
+
+def score_pair(artist, title, cand_artist, cand_title):
+    return 0.55 * similarity(title, cand_title) + 0.45 * similarity(artist, cand_artist)
+
+
+def spotify_api_search(artist, title):
+    """Spotify search API. The shared spotdl app is often 429'd for the whole day,
+    so treat any failure as 'try another way', not an error."""
+    tok = spotify_token()
+    best, best_score = None, 0.0
+    q = urllib.parse.quote(f"{artist} {re.sub(r'[(].*?[)]', '', title).strip()}")
+    data = http_get_json(
+        f"https://api.spotify.com/v1/search?type=track&limit=5&q={q}",
+        headers={"Authorization": f"Bearer {tok}"}, timeout=15)
+    for it in data.get("tracks", {}).get("items", []):
+        sp_artists = ", ".join(a["name"] for a in it["artists"])
+        score = score_pair(artist, title, sp_artists, it["name"])
+        if score > best_score:
+            best_score = score
+            best = {
+                "url": it["external_urls"]["spotify"],
+                "artist": sp_artists,
+                "title": it["name"],
+                "duration_s": it["duration_ms"] // 1000,
+                "score": round(score, 2),
+            }
+    return best if best_score >= MATCH_THRESHOLD else False  # False = definitive miss
+
+
+def spotify_match(artist, title):
+    """Best Spotify track, or None. The shared spotdl app quota is often burned
+    for the day (429 Retry-After 86400) — treat that as 'no Spotify today'."""
+    key = f"sp:{artist}|{title}".lower()
+    cached = cache_get(key)
+    if cached is not None:
+        return cached or None
+    try:
+        result = spotify_api_search(artist, title)
+    except Exception as e:
+        print(f"[spotify] unavailable for {artist} - {title}: {e}", flush=True)
+        return None  # transient — retry next time
+    cache_put(key, result or False)
+    return result or None
+
+
+def itunes_match(artist, title):
+    """Canonical artist/title/duration from the open iTunes Search API."""
+    key = f"it:{artist}|{title}".lower()
+    cached = cache_get(key)
+    if cached is not None:
+        return cached or None
+    q = urllib.parse.urlencode({"term": f"{artist} {title}", "entity": "song", "limit": 5})
+    try:
+        data = json.loads(http_get(f"https://itunes.apple.com/search?{q}", timeout=20))
+    except Exception as e:
+        print(f"[itunes] failed for {artist} - {title}: {e}", flush=True)
+        return None
+    best, best_score = None, 0.0
+    for it in data.get("results", []):
+        score = score_pair(artist, title, it.get("artistName", ""), it.get("trackName", ""))
+        if score > best_score:
+            best_score = score
+            best = {"artist": it.get("artistName", ""), "title": it.get("trackName", ""),
+                    "duration_s": (it.get("trackTimeMillis") or 0) // 1000,
+                    "score": round(score, 2)}
+    result = best if best_score >= MATCH_THRESHOLD else False
+    cache_put(key, result)
+    return result or None
+
+
+def youtube_pick(artist, title, expected_s=0):
+    """Pick the best real YouTube watch URL for a track. Prefers auto-generated
+    'Topic' uploads (correct artist/track tags) and verifies duration when known."""
+    key = f"yt:{artist}|{title}|{expected_s}".lower()
+    cached = cache_get(key)
+    if cached is not None:
+        return cached or None
+    fmt = "%(webpage_url)s\t%(artist,creator|)s\t%(track|)s\t%(duration|0)s\t%(channel|)s\t%(title|)s"
+    try:
+        r = subprocess.run(
+            ["yt-dlp", "--print", fmt, "--no-playlist", "--flat-playlist",
+             f"ytsearch3:{artist} {title} audio"],
+            capture_output=True, text=True, timeout=60)
+        lines = [l for l in r.stdout.strip().split("\n") if l.startswith("http")]
+    except Exception:
+        lines = []
+    best, best_score = None, -1.0
+    for line in lines:
+        parts = (line.split("\t") + [""] * 6)[:6]
+        url, yt_artist, yt_track, dur, channel, vtitle = parts
+        try:
+            dur = float(dur or 0)
+        except ValueError:
+            dur = 0
+        if expected_s and dur and (dur > expected_s * 1.6 or dur < expected_s * 0.5):
+            continue  # wrong thing: podcast, full set, snippet
+        cand = f"{yt_artist} {yt_track}".strip() or vtitle or channel
+        score = similarity(f"{artist} {title}", cand)
+        if channel.endswith(" - Topic") or (yt_artist and yt_track):
+            score += 0.3  # auto-generated upload → clean ID3 tags downstream
+        if expected_s and dur:
+            score += 0.2 - min(abs(dur - expected_s) / expected_s, 0.2)
+        if score > best_score:
+            best_score, best = score, url
+    cache_put(key, best or False)
+    return best
+
+
+# ── download jobs (feed amapiano, limited concurrency) ──
+
+_jobs = {}
+_jobs_lock = threading.Lock()
+
+
+def amapiano_up():
+    try:
+        http_get_json(f"{AMAPIANO}/api/downloads", timeout=3)
+        return True
+    except Exception:
+        return False
+
+
+def amapiano_download(url, name, meta_name=None):
+    body = {"url": url, "name": name}
+    if meta_name:
+        body["meta_name"] = meta_name  # forces clean "Artist - Title" filename
+    req = urllib.request.Request(
+        f"{AMAPIANO}/api/download",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    return json.loads(urllib.request.urlopen(req, timeout=30).read())
+
+
+def amapiano_status(dl_id):
+    return http_get_json(f"{AMAPIANO}/api/download/{dl_id}", timeout=10)
+
+
+def _run_job(job_id):
+    with _jobs_lock:
+        job = _jobs[job_id]
+    name = job["name"]
+    for item in job["items"]:
+        if item.get("skip"):
+            item["status"] = "skipped"
+            continue
+        url = item.get("spotify_url")
+        source = "spotify"
+        if not url:
+            url = youtube_pick(item["artist"], item["title"], item.get("duration_s") or 0)
+            source = "youtube"
+        if not url:
+            item["status"] = "not_found"
+            continue
+        item["source"] = source
+        try:
+            meta = None
+            if source == "youtube":
+                meta = f"{item['artist']} - {item['title']}" if item["artist"] else item["name"]
+            resp = amapiano_download(url, name, meta)
+            item["amapiano_id"] = resp.get("id")
+            item["status"] = "downloading"
+        except Exception as e:
+            item["status"] = "error"
+            item["error"] = str(e)[:200]
+            continue
+        # wait for this track before submitting the next — keeps yt-dlp serial
+        deadline = time.time() + 300
+        while time.time() < deadline:
+            time.sleep(3)
+            try:
+                st = amapiano_status(item["amapiano_id"])
+            except Exception:
+                continue
+            if st.get("status") in ("done", "error"):
+                ok = st.get("status") == "done" and not st.get("error")
+                item["status"] = "done" if ok else "error"
+                if st.get("error"):
+                    item["error"] = str(st["error"])[:200]
+                break
+        else:
+            item["status"] = "timeout"
+    with _jobs_lock:
+        job["status"] = "done"
+        job["finished"] = time.time()
+
+
+# ── API ──
+
+@app.route("/")
+def index():
+    return send_from_directory(BASE / "public", "index.html")
+
+
+@app.route("/api/health")
+def health():
+    return jsonify({"ok": True, "amapiano": amapiano_up()})
+
+
+@app.route("/api/resolve", methods=["POST", "OPTIONS"])
+def resolve():
+    if request.method == "OPTIONS":
+        return "", 204
+    q = (request.json or {}).get("url", "").strip()
+    if not q:
+        return jsonify({"error": "URL or DJ name required"}), 400
+
+    tl = TL_URL_RE.search(q)
+    if tl:
+        tlid, slug = tl.groups()
+        url = f"https://www.1001tracklists.com/tracklist/{tlid}/{slug}.html"
+        html, source = fetch_page(url)
+        if not html:
+            return jsonify({
+                "type": "manual_needed", "url": url,
+                "reason": "Not archived on Wayback and Cloudflare blocks live fetch. "
+                          "Open the page in your browser and use the bookmarklet or paste mode.",
+            })
+        tracks = parse_tracks(html)
+        return jsonify({"type": "tracklist", "url": url, "source": source,
+                        "title": parse_set_title(html), "tracks": tracks})
+
+    dj = DJ_URL_RE.search(q)
+    if dj or ("/" not in q and len(q) > 1):
+        if dj:
+            dj_slug = dj.group(1)
+            name = dj_display_name(dj_slug)
+        else:
+            name = q
+        sets = ddg_sets_for(name)
+        # DJ page snapshot may list sets CDX misses
+        if dj:
+            html, _ = fetch_page(f"https://www.1001tracklists.com/dj/{dj.group(1)}/index.html")
+            if html:
+                known = {s["id"] for s in sets}
+                for link in parse_tracklist_links(html):
+                    m = TL_URL_RE.search(link["url"])
+                    if m and m.group(1) not in known:
+                        title, date = slug_to_title(link["slug"])
+                        sets.append({"url": link["url"], "id": m.group(1),
+                                     "title": title, "date": date, "archived": ""})
+        sets.sort(key=lambda s: s["date"], reverse=True)
+        return jsonify({"type": "dj", "name": name, "sets": sets})
+
+    return jsonify({"error": "Drop a 1001tracklists tracklist/DJ URL or a DJ name"}), 400
+
+
+@app.route("/api/ingest", methods=["POST", "OPTIONS"])
+def ingest():
+    """Bookmarklet / paste fallback: raw HTML or plain 'Artist - Title' lines."""
+    if request.method == "OPTIONS":
+        return "", 204
+    data = request.json or {}
+    raw = data.get("html", "") or data.get("text", "")
+    if not raw:
+        return jsonify({"error": "html or text required"}), 400
+    tracks = parse_tracks(raw)
+    title = parse_set_title(raw) if "<" in raw else ""
+    if not tracks:  # plain text: one track per line
+        for line in raw.splitlines():
+            line = re.sub(r"^\s*[\d:.\[\]]+\s*", "", line).strip()  # strip cues
+            if " - " in line and len(line) > 5:
+                tracks.append(make_track(line, len(tracks) + 1))
+    if not tracks:
+        return jsonify({"error": "No tracks found in that content"}), 422
+    result = {"type": "tracklist", "url": data.get("url", ""), "source": "manual",
+              "title": title or data.get("title") or "Pasted setlist",
+              "tracks": tracks}
+    ingest_id = hashlib.md5(f"{time.time()}".encode()).hexdigest()[:8]
+    cache_put("ingest:" + ingest_id, result)
+    return jsonify({"id": ingest_id, **result})
+
+
+@app.route("/api/ingest/<ingest_id>")
+def ingest_get(ingest_id):
+    result = cache_get("ingest:" + ingest_id)
+    if not result:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(result)
+
+
+@app.route("/api/match", methods=["POST"])
+def match():
+    """Spotify-match a list of tracks. Called per-batch by the UI."""
+    tracks = (request.json or {}).get("tracks", [])
+    out = []
+    for t in tracks:
+        if t.get("unknown"):
+            out.append({**t, "match": None, "match_status": "id_track"})
+            continue
+        m = spotify_match(t["artist"], t["title"])
+        if m:
+            out.append({**t, "match": m, "match_status": "spotify"})
+            continue
+        it = itunes_match(t["artist"], t["title"])
+        if it:
+            out.append({**t, "match": None, "verified": it, "match_status": "verified"})
+        else:
+            out.append({**t, "match": None, "match_status": "youtube_fallback"})
+    return jsonify({"tracks": out})
+
+
+@app.route("/api/download", methods=["POST"])
+def download():
+    data = request.json or {}
+    name = (data.get("name") or "Setlist").strip()
+    items = data.get("tracks", [])
+    if not items:
+        return jsonify({"error": "tracks required"}), 400
+    if not amapiano_up():
+        return jsonify({"error": "amapiano server is not running — start it: "
+                        "cd ~/amapiano && source .venv/bin/activate && python server.py &"}), 503
+    job_id = hashlib.md5(f"{name}{time.time()}".encode()).hexdigest()[:10]
+    job = {"id": job_id, "name": name, "status": "running", "started": time.time(),
+           "items": [{
+               "n": t.get("n"), "artist": t.get("artist", ""), "title": t.get("title", ""),
+               "name": t.get("name", ""), "spotify_url": (t.get("match") or {}).get("url"),
+               "duration_s": ((t.get("match") or t.get("verified") or {}).get("duration_s")),
+               "skip": bool(t.get("unknown")), "status": "queued",
+           } for t in items]}
+    with _jobs_lock:
+        _jobs[job_id] = job
+    threading.Thread(target=_run_job, args=(job_id,), daemon=True).start()
+    return jsonify({"id": job_id, "count": len(job["items"])})
+
+
+@app.route("/api/job/<job_id>")
+def job_status(job_id):
+    with _jobs_lock:
+        job = _jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(job)
+
+
+if __name__ == "__main__":
+    print(f"Setlist running on http://localhost:{PORT}")
+    app.run(host="127.0.0.1", port=PORT, debug=False)

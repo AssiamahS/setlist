@@ -1,0 +1,281 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Setlist</title>
+<style>
+  :root {
+    --bg: #0c0e12; --panel: #14171d; --panel2: #1a1e26; --line: #262b35;
+    --txt: #e8eaee; --dim: #8b93a1; --accent: #33d17a; --accent2: #f5c518;
+    --red: #e8564f; --blue: #4f9cf0;
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { background: var(--bg); color: var(--txt); font: 15px/1.5 -apple-system, "SF Pro Text", Helvetica, Arial, sans-serif; min-height: 100vh; }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 28px 20px 80px; }
+  header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 24px; }
+  h1 { font-size: 26px; letter-spacing: 4px; font-weight: 800; }
+  h1 span { color: var(--accent); }
+  .amastatus { margin-left: auto; font-size: 12px; color: var(--dim); display: flex; align-items: center; gap: 6px; }
+  .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--red); }
+  .dot.up { background: var(--accent); }
+  .tabs { display: flex; gap: 8px; margin-bottom: 14px; }
+  .tab { padding: 6px 14px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--dim); cursor: pointer; font-size: 13px; }
+  .tab.on { color: var(--txt); border-color: var(--accent); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 18px; margin-bottom: 18px; }
+  .row { display: flex; gap: 10px; }
+  input[type=text], textarea {
+    flex: 1; background: var(--panel2); border: 1px solid var(--line); color: var(--txt);
+    border-radius: 10px; padding: 12px 14px; font-size: 15px; outline: none; font-family: inherit;
+  }
+  input[type=text]:focus, textarea:focus { border-color: var(--accent); }
+  textarea { width: 100%; min-height: 140px; resize: vertical; margin-bottom: 10px; }
+  button {
+    background: var(--accent); color: #08130c; border: 0; border-radius: 10px;
+    padding: 12px 20px; font-size: 15px; font-weight: 700; cursor: pointer;
+  }
+  button:disabled { opacity: .45; cursor: default; }
+  button.ghost { background: var(--panel2); color: var(--txt); border: 1px solid var(--line); font-weight: 500; }
+  .hint { color: var(--dim); font-size: 12.5px; margin-top: 10px; }
+  .hint a { color: var(--blue); }
+  .err { color: var(--red); margin-top: 10px; font-size: 14px; }
+  .settitle { font-size: 18px; font-weight: 700; }
+  .badge { display: inline-block; font-size: 11px; padding: 2px 8px; border-radius: 20px; background: var(--panel2); border: 1px solid var(--line); color: var(--dim); margin-left: 8px; vertical-align: 2px; }
+  table { width: 100%; border-collapse: collapse; margin-top: 12px; }
+  th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 1px; color: var(--dim); padding: 6px 8px; border-bottom: 1px solid var(--line); }
+  td { padding: 8px; border-bottom: 1px solid var(--line); font-size: 14px; vertical-align: top; }
+  tr:last-child td { border-bottom: 0; }
+  td.n { color: var(--dim); width: 30px; }
+  .st { font-size: 12px; white-space: nowrap; }
+  .st.spotify { color: var(--accent); }
+  .st.verified { color: var(--blue); }
+  .st.youtube_fallback { color: var(--accent2); }
+  .st.id_track, .st.skipped { color: var(--dim); }
+  .st.matching { color: var(--dim); }
+  .st.downloading { color: var(--blue); }
+  .st.done { color: var(--accent); }
+  .st.error, .st.not_found, .st.timeout { color: var(--red); }
+  .matchmeta { color: var(--dim); font-size: 12px; }
+  .setlink { display: block; padding: 11px 14px; border-bottom: 1px solid var(--line); cursor: pointer; }
+  .setlink:hover { background: var(--panel2); }
+  .setlink .date { color: var(--dim); font-size: 12.5px; margin-left: 8px; }
+  .toolbar { display: flex; align-items: center; gap: 12px; margin-top: 14px; }
+  .progress { flex: 1; height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; }
+  .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
+  .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: r 0.8s linear infinite; vertical-align: -2px; }
+  @keyframes r { to { transform: rotate(360deg); } }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>SET<span>LIST</span></h1>
+    <div class="amastatus"><span class="dot" id="amaDot"></span><span id="amaTxt">amapiano</span></div>
+  </header>
+
+  <div class="tabs">
+    <div class="tab on" data-tab="url">URL</div>
+    <div class="tab" data-tab="paste">Paste</div>
+  </div>
+
+  <div class="card" id="urlCard">
+    <div class="row">
+      <input type="text" id="urlInput" placeholder="1001tracklists URL or DJ name — e.g. https://www.1001tracklists.com/dj/jameshype/index.html" spellcheck="false">
+      <button id="goBtn">Pull tracks</button>
+    </div>
+    <div class="hint">
+      Tracklist URL → every track in that set. DJ URL or name → all their archived sets.
+      Live pages are Cloudflare-blocked, so pages come from the Wayback Machine when needed.
+      For a brand-new set: open it in your browser, then drag this to your bookmarks bar →
+      <a id="bml" href="#">Setlist grab</a> — click it on any tracklist page.
+    </div>
+    <div class="err" id="urlErr"></div>
+  </div>
+
+  <div class="card" id="pasteCard" style="display:none">
+    <textarea id="pasteInput" placeholder="Paste the whole tracklist page (Cmd+A, Cmd+C on 1001tracklists) or plain lines like:&#10;James Hype - Ferrari&#10;Fred again.. - Rumble"></textarea>
+    <div class="row">
+      <input type="text" id="pasteName" placeholder="Set name (used for the folder + Serato crate)">
+      <button id="pasteBtn">Parse</button>
+    </div>
+    <div class="err" id="pasteErr"></div>
+  </div>
+
+  <div id="results"></div>
+</div>
+
+<script>
+const $ = s => document.querySelector(s);
+const api = (path, body) => fetch(path, body ? {
+  method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)
+} : {}).then(async r => { const j = await r.json(); if (!r.ok) throw new Error(j.error || r.status); return j; });
+
+const esc = s => (s || "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+
+// tabs
+document.querySelectorAll(".tab").forEach(t => t.onclick = () => {
+  document.querySelectorAll(".tab").forEach(x => x.classList.toggle("on", x === t));
+  $("#urlCard").style.display = t.dataset.tab === "url" ? "" : "none";
+  $("#pasteCard").style.display = t.dataset.tab === "paste" ? "" : "none";
+});
+
+// bookmarklet
+$("#bml").href = "javascript:" + encodeURIComponent(
+  "(async()=>{try{const r=await fetch('http://localhost:8787/api/ingest',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({html:document.documentElement.outerHTML,url:location.href})});const j=await r.json();if(j.id)window.open('http://localhost:8787/?ingest='+j.id);else alert(j.error||'no tracks found')}catch(e){alert('Setlist server not running on :8787')}})()");
+
+// amapiano status
+async function amaCheck() {
+  try { const h = await api("/api/health");
+    $("#amaDot").className = "dot" + (h.amapiano ? " up" : "");
+    $("#amaTxt").textContent = h.amapiano ? "amapiano connected" : "amapiano offline";
+  } catch (e) {}
+}
+amaCheck(); setInterval(amaCheck, 15000);
+
+let current = null; // {title, tracks}
+
+$("#goBtn").onclick = () => resolve($("#urlInput").value.trim());
+$("#urlInput").addEventListener("keydown", e => { if (e.key === "Enter") $("#goBtn").click(); });
+
+async function resolve(q) {
+  if (!q) return;
+  $("#urlErr").textContent = "";
+  $("#results").innerHTML = '<div class="card"><span class="spin"></span> Fetching… (Wayback lookups can take ~10s, DJ searches up to a minute)</div>';
+  try {
+    const r = await api("/api/resolve", {url: q});
+    if (r.type === "tracklist") showTracklist(r);
+    else if (r.type === "dj") showDJ(r);
+    else if (r.type === "manual_needed") {
+      $("#results").innerHTML = `<div class="card">This set isn't archived yet and the live page is Cloudflare-blocked.<div class="hint">${esc(r.reason)}</div></div>`;
+    }
+  } catch (e) {
+    $("#results").innerHTML = "";
+    $("#urlErr").textContent = e.message;
+  }
+}
+
+$("#pasteBtn").onclick = async () => {
+  $("#pasteErr").textContent = "";
+  const raw = $("#pasteInput").value;
+  if (!raw.trim()) return;
+  try {
+    const body = raw.includes("<") ? {html: raw} : {text: raw};
+    body.title = $("#pasteName").value.trim();
+    const r = await api("/api/ingest", body);
+    showTracklist(r);
+  } catch (e) { $("#pasteErr").textContent = e.message; }
+};
+
+function showDJ(r) {
+  const rows = r.sets.map(s =>
+    `<div class="setlink" data-url="${esc(s.url)}"><b>${esc(s.title)}</b>` +
+    `<span class="date">${esc(s.date || "")}</span>` +
+    (s.archived ? `<span class="badge">archived ${esc(s.archived)}</span>` : "") + `</div>`).join("");
+  $("#results").innerHTML =
+    `<div class="card" style="padding:0"><div style="padding:16px 14px 10px"><span class="settitle">${esc(r.name)}</span>` +
+    `<span class="badge">${r.sets.length} sets</span></div>${rows || '<div style="padding:14px">No archived sets found.</div>'}</div>`;
+  document.querySelectorAll(".setlink").forEach(el => el.onclick = () => resolve(el.dataset.url));
+}
+
+function trackRow(t) {
+  return `<tr data-n="${t.n}">
+    <td class="n">${t.n}</td>
+    <td><b>${esc(t.artist)}</b> — ${esc(t.title)}
+      <div class="matchmeta" id="meta${t.n}"></div></td>
+    <td class="st matching" id="st${t.n}"><span class="spin"></span></td>
+  </tr>`;
+}
+
+async function showTracklist(r) {
+  current = r;
+  $("#results").innerHTML = `<div class="card">
+    <span class="settitle">${esc(r.title)}</span>
+    <span class="badge">${esc(r.source)}</span>
+    <span class="badge">${r.tracks.length} tracks</span>
+    <table><thead><tr><th>#</th><th>Track</th><th>Status</th></tr></thead>
+    <tbody>${r.tracks.map(trackRow).join("")}</tbody></table>
+    <div class="toolbar">
+      <button id="dlBtn" disabled>Matching…</button>
+      <div class="progress"><i id="bar"></i></div>
+      <span class="hint" id="jobTxt"></span>
+    </div></div>`;
+
+  // match in batches of 8
+  const matched = [];
+  for (let i = 0; i < r.tracks.length; i += 8) {
+    const batch = r.tracks.slice(i, i + 8);
+    try {
+      const res = await api("/api/match", {tracks: batch});
+      res.tracks.forEach(t => {
+        matched.push(t);
+        const st = $("#st" + t.n), meta = $("#meta" + t.n);
+        if (t.match_status === "spotify") {
+          st.className = "st spotify"; st.textContent = "Spotify";
+          meta.textContent = `${t.match.artist} — ${t.match.title}`;
+        } else if (t.match_status === "verified") {
+          st.className = "st verified"; st.textContent = "verified ✓";
+          meta.textContent = `${t.verified.artist} — ${t.verified.title}`;
+        } else if (t.match_status === "id_track") {
+          st.className = "st id_track"; st.textContent = "ID — skipped";
+        } else {
+          st.className = "st youtube_fallback"; st.textContent = "YouTube fallback";
+        }
+      });
+    } catch (e) {
+      batch.forEach(t => { matched.push({...t, match: null, match_status: "youtube_fallback"});
+        const st = $("#st" + t.n); st.className = "st youtube_fallback"; st.textContent = "YouTube fallback"; });
+    }
+  }
+  current.tracks = matched;
+  const dlable = matched.filter(t => !t.unknown).length;
+  const btn = $("#dlBtn");
+  btn.textContent = `Download ${dlable} tracks`;
+  btn.disabled = !dlable;
+  btn.onclick = startDownload;
+}
+
+async function startDownload() {
+  const btn = $("#dlBtn");
+  btn.disabled = true; btn.textContent = "Downloading…";
+  try {
+    const job = await api("/api/download", {name: current.title, tracks: current.tracks});
+    pollJob(job.id);
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "Retry download";
+    $("#jobTxt").textContent = e.message;
+  }
+}
+
+async function pollJob(id) {
+  const t = setInterval(async () => {
+    try {
+      const job = await api("/api/job/" + id);
+      let done = 0;
+      job.items.forEach(it => {
+        const st = $("#st" + it.n);
+        if (!st) return;
+        if (["done","error","not_found","timeout","skipped"].includes(it.status)) done++;
+        if (it.status === "queued") return; // keep match badge until it starts
+        st.className = "st " + it.status;
+        st.textContent = {downloading: "downloading…", done: "✓ downloaded", error: "failed",
+                          not_found: "not found", timeout: "timeout", skipped: "skipped"}[it.status] || it.status;
+        if (it.error) $("#meta" + it.n).textContent = it.error;
+        else if (it.source === "youtube" && it.status === "done") $("#meta" + it.n).textContent += " (via YouTube)";
+      });
+      $("#bar").style.width = (100 * done / job.items.length) + "%";
+      $("#jobTxt").textContent = `${done}/${job.items.length}`;
+      if (job.status === "done") {
+        clearInterval(t);
+        const ok = job.items.filter(i => i.status === "done").length;
+        $("#dlBtn").textContent = `Done — ${ok}/${job.items.length} in library`;
+      }
+    } catch (e) { clearInterval(t); }
+  }, 2500);
+}
+
+// bookmarklet round-trip
+const ingestId = new URLSearchParams(location.search).get("ingest");
+if (ingestId) api("/api/ingest/" + ingestId).then(showTracklist).catch(() => {});
+</script>
+</body>
+</html>

@@ -1,0 +1,6 @@
+.venv/
+cache/
+__pycache__/
+server.log
+.DS_Store
+NOTES.md
