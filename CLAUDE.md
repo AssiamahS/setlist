@@ -14,6 +14,9 @@ through the amapiano server into the shared library / Serato crates / rekordbox.
 - DJ URL or plain DJ name → Wayback CDX search over `1001tracklists.com/tracklist*`
   for slugs containing the hyphenated DJ name → list of archived sets.
 - Tracks parsed from schema.org `MusicRecording` metas (also works on pasted page HTML).
+- YouTube set URL → yt-dlp -J: chapters → description lines → Apple Music album link
+  in description (page JSON-LD has the full mix tracklist) → top-40 comments.
+  Apple Music album URLs also accepted directly. IDn tracks flagged unknown/skipped.
 - Spotify matching uses the spotdl app creds from `~/.spotdl/config.json`
   (client_credentials flow; the pair hardcoded in amapiano/server.py died — this one works).
 - Downloads: POST per track to amapiano `/api/download` with name = set title, serial

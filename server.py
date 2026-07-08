@@ -176,9 +176,29 @@ def make_track(name, n):
     if not title:
         artist, title = "", name
     artist, title = artist.strip(), title.strip()
-    # "ID - ID", "Artist - ID", "ID - Title": unidentified — nothing to search for
-    is_id = artist.upper() == "ID" or title.upper() == "ID"
+    # "ID - ID", "Artist - ID", "ID2 - Title": unidentified — nothing to search for
+    is_id = bool(re.fullmatch(r"ID\d*", artist, re.I) or re.fullmatch(r"ID\d*", title, re.I))
     return {"n": n, "name": name, "artist": artist, "title": title, "unknown": is_id}
+
+
+CUE_PREFIX_RE = re.compile(r"^\s*(?:[\d]+[.):]|\[?\d{1,2}:\d{2}(?::\d{2})?\]?|[•*>▶︎♪-])*\s*")
+
+
+def tracks_from_lines(lines):
+    """'Artist - Title' tracks from free-form lines (descriptions, chapters,
+    comments, pasted text). Strips leading timestamps/numbering/bullets and
+    normalizes en/em dashes."""
+    tracks, seen = [], set()
+    for line in lines:
+        line = re.sub(r"\s+[–—]\s+", " - ", line)
+        line = CUE_PREFIX_RE.sub("", line).strip()
+        if " - " not in line or len(line) < 6 or line.lower() in seen:
+            continue
+        if line.count("http") or line.count("@") > 1:
+            continue  # link/social lines, not tracks
+        seen.add(line.lower())
+        tracks.append(make_track(line, len(tracks) + 1))
+    return tracks
 
 
 def parse_set_title(html):
@@ -215,6 +235,95 @@ def slug_to_title(slug):
         date = "-".join(parts[1:])
         slug = parts[0]
     return slug.replace("-", " ").title(), date
+
+
+# ── YouTube sets + Apple Music DJ-mix albums ──
+
+YT_URL_RE = re.compile(r"(?:youtube\.com/(?:watch|live/|shorts/)|youtu\.be/)", re.I)
+APPLE_ALBUM_RE = re.compile(r"music\.apple\.com/[a-z]{2}/album/[^\s\"'<>)]+", re.I)
+ISO_DUR_RE = re.compile(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?")
+
+
+def iso_duration_s(s):
+    m = ISO_DUR_RE.fullmatch(s or "")
+    if not m:
+        return 0
+    h, mn, sec = (int(x or 0) for x in m.groups())
+    return h * 3600 + mn * 60 + sec
+
+
+def apple_album_tracks(album_url):
+    """(album_title, tracks) from an Apple Music album page's JSON-LD.
+    DJ mixes list every track played — Apple's own 1001tracklists."""
+    if not album_url.startswith("http"):
+        album_url = "https://" + album_url
+    cached = cache_get("am:" + album_url, max_age=24 * 3600)
+    if cached:
+        return cached["title"], cached["tracks"]
+    html = http_get(album_url, timeout=30)
+    m = re.search(r'<script[^>]*type="application/ld\+json"[^>]*>(.*?)</script>', html, re.S)
+    if not m:
+        return None, []
+    d = json.loads(m.group(1))
+    if d.get("@type") != "MusicAlbum":
+        return None, []
+    album_artist = (d.get("byArtist") or [{}])[0].get("name", "")
+    title = d.get("name", "Apple Music album")
+    tracks = []
+    for t in d.get("tracks", []):
+        name = t.get("name", "")
+        name = re.sub(r"\s*[\[(](?:Mixed|from [^)\]]*)[)\]]", "", name).strip()
+        if not name:
+            continue
+        if " - " not in name and album_artist:
+            name = f"{album_artist} - {name}"
+        track = make_track(name, len(tracks) + 1)
+        track["duration_s"] = iso_duration_s(t.get("duration"))
+        tracks.append(track)
+    if tracks:
+        cache_put("am:" + album_url, {"title": title, "tracks": tracks})
+    return title, tracks
+
+
+def ytdlp_json(url, comments=False):
+    cmd = ["yt-dlp", "-J", "--no-playlist", url]
+    if comments:
+        cmd[1:1] = ["--write-comments",
+                    "--extractor-args", "youtube:comment_sort=top;max_comments=40,40,0,0"]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+    if r.returncode != 0:
+        raise RuntimeError(r.stderr.strip().split("\n")[-1][:200] if r.stderr else "yt-dlp failed")
+    return json.loads(r.stdout)
+
+
+def resolve_youtube(url):
+    """Tracklist for a YouTube DJ set: chapters → description lines →
+    Apple Music album linked in the description → top comments."""
+    j = ytdlp_json(url)
+    title = j.get("title") or "YouTube set"
+    desc = j.get("description") or ""
+
+    tracks = tracks_from_lines(c.get("title", "") for c in j.get("chapters") or [])
+    source = "youtube chapters"
+    if len(tracks) < 3:
+        tracks, source = tracks_from_lines(desc.splitlines()), "youtube description"
+    if len(tracks) < 3:
+        am = APPLE_ALBUM_RE.search(desc)
+        if am:
+            am_title, tracks = apple_album_tracks(am.group(0).rstrip(").,"))
+            source = "apple music mix album"
+    if len(tracks) < 3:
+        try:
+            jc = ytdlp_json(url, comments=True)
+            for c in jc.get("comments") or []:
+                found = tracks_from_lines((c.get("text") or "").splitlines())
+                if len(found) >= 3:
+                    tracks, source = found, "youtube comments"
+                    break
+        except Exception as e:
+            print(f"[youtube] comments fetch failed: {e}", flush=True)
+    return {"type": "tracklist", "url": url, "source": source,
+            "title": title, "tracks": tracks}
 
 
 # ── DJ set discovery: DuckDuckGo (fresh) + archived DJ page (history) ──
@@ -357,6 +466,9 @@ def itunes_match(artist, title):
     best, best_score = None, 0.0
     for it in data.get("results", []):
         score = score_pair(artist, title, it.get("artistName", ""), it.get("trackName", ""))
+        # prefer original releases over DJ-mix segments (segment durations lie)
+        if "(mixed)" in it.get("trackName", "").lower() and "(mixed)" not in title.lower():
+            score -= 0.15
         if score > best_score:
             best_score = score
             best = {"artist": it.get("artistName", ""), "title": it.get("trackName", ""),
@@ -518,6 +630,30 @@ def resolve():
         return jsonify({"type": "tracklist", "url": url, "source": source,
                         "title": parse_set_title(html), "tracks": tracks})
 
+    if YT_URL_RE.search(q):
+        try:
+            r = resolve_youtube(q)
+        except Exception as e:
+            return jsonify({"error": f"YouTube fetch failed: {e}"}), 502
+        if not r["tracks"]:
+            return jsonify({
+                "type": "manual_needed", "url": q,
+                "reason": "No tracklist in this video's chapters, description, linked "
+                          "Apple Music album, or top comments. If you find one, use paste mode.",
+            })
+        return jsonify(r)
+
+    am = APPLE_ALBUM_RE.search(q)
+    if am:
+        try:
+            title, tracks = apple_album_tracks(am.group(0))
+        except Exception as e:
+            return jsonify({"error": f"Apple Music fetch failed: {e}"}), 502
+        if not tracks:
+            return jsonify({"error": "No tracklist found on that Apple Music page"}), 422
+        return jsonify({"type": "tracklist", "url": q, "source": "apple music album",
+                        "title": title, "tracks": tracks})
+
     dj = DJ_URL_RE.search(q)
     if dj or ("/" not in q and len(q) > 1):
         if dj:
@@ -540,7 +676,8 @@ def resolve():
         sets.sort(key=lambda s: s["date"], reverse=True)
         return jsonify({"type": "dj", "name": name, "sets": sets})
 
-    return jsonify({"error": "Drop a 1001tracklists tracklist/DJ URL or a DJ name"}), 400
+    return jsonify({"error": "Drop a 1001tracklists tracklist/DJ URL, a YouTube set, "
+                    "an Apple Music album, or a DJ name"}), 400
 
 
 @app.route("/api/ingest", methods=["POST", "OPTIONS"])
@@ -555,10 +692,7 @@ def ingest():
     tracks = parse_tracks(raw)
     title = parse_set_title(raw) if "<" in raw else ""
     if not tracks:  # plain text: one track per line
-        for line in raw.splitlines():
-            line = re.sub(r"^\s*[\d:.\[\]]+\s*", "", line).strip()  # strip cues
-            if " - " in line and len(line) > 5:
-                tracks.append(make_track(line, len(tracks) + 1))
+        tracks = tracks_from_lines(raw.splitlines())
     if not tracks:
         return jsonify({"error": "No tracks found in that content"}), 422
     result = {"type": "tracklist", "url": data.get("url", ""), "source": "manual",
@@ -613,7 +747,8 @@ def download():
            "items": [{
                "n": t.get("n"), "artist": t.get("artist", ""), "title": t.get("title", ""),
                "name": t.get("name", ""), "spotify_url": (t.get("match") or {}).get("url"),
-               "duration_s": ((t.get("match") or t.get("verified") or {}).get("duration_s")),
+               "duration_s": ((t.get("match") or t.get("verified") or {}).get("duration_s")
+                              or t.get("duration_s")),
                "skip": bool(t.get("unknown")), "status": "queued",
            } for t in items]}
     with _jobs_lock:

@@ -80,12 +80,13 @@
 
   <div class="card" id="urlCard">
     <div class="row">
-      <input type="text" id="urlInput" placeholder="1001tracklists URL or DJ name — e.g. https://www.1001tracklists.com/dj/jameshype/index.html" spellcheck="false">
+      <input type="text" id="urlInput" placeholder="1001tracklists / YouTube set / Apple Music album URL — or just a DJ name" spellcheck="false">
       <button id="goBtn">Pull tracks</button>
     </div>
     <div class="hint">
       Tracklist URL → every track in that set. DJ URL or name → all their archived sets.
-      Live pages are Cloudflare-blocked, so pages come from the Wayback Machine when needed.
+      YouTube set → tracklist from chapters, description, its Apple Music mix album, or top comments.
+      1001tracklists live pages are Cloudflare-blocked, so those come from the Wayback Machine when needed.
       For a brand-new set: open it in your browser, then drag this to your bookmarks bar →
       <a id="bml" href="#">Setlist grab</a> — click it on any tracklist page.
     </div>
@@ -140,7 +141,7 @@ $("#urlInput").addEventListener("keydown", e => { if (e.key === "Enter") $("#goB
 async function resolve(q) {
   if (!q) return;
   $("#urlErr").textContent = "";
-  $("#results").innerHTML = '<div class="card"><span class="spin"></span> Fetching… (Wayback lookups can take ~10s, DJ searches up to a minute)</div>';
+  $("#results").innerHTML = '<div class="card"><span class="spin"></span> Fetching… (Wayback/YouTube lookups can take ~10-30s, DJ searches up to a minute)</div>';
   try {
     const r = await api("/api/resolve", {url: q});
     if (r.type === "tracklist") showTracklist(r);

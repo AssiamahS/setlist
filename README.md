@@ -6,6 +6,9 @@ played, and download them into your library.
 - **Tracklist URL** → the full set, track by track
 - **DJ URL or just a name** (e.g. `james hype`) → every archived set they've played,
   click into any of them
+- **YouTube set URL** → tracklist from the video's chapters, description, the Apple
+  Music mix album it links, or the top comments
+- **Apple Music album URL** → the album/DJ-mix tracklist directly
 - **Paste mode / bookmarklet** → for brand-new sets that aren't archived yet
 
 Each track is matched on Spotify first (clean metadata); unmatched tracks fall back
