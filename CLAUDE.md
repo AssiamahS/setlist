@@ -3,6 +3,29 @@
 Drop a 1001tracklists URL (tracklist or DJ page) → pulls every track → downloads
 through the amapiano server into the shared library / Serato crates / rekordbox.
 
+## DWREK set recorder (`/recorder`, "⏺ DWREK" link in the header)
+- Records a live set on the DDJ-SB3 while Serato DJ Pro owns it: `midi_capture.py`
+  (runs under `~/cratemate/.venv/bin/python` — python-rtmidi won't build on this
+  venv's 3.14) opens the controller's input as a second CoreMIDI client, so it's a
+  passive tap; Serato is unaffected. Raw events land in `recordings/<id>/midi.jsonl`.
+- Tracks come from Serato's own history session files
+  (`~/Music/_Serato_/History/Sessions/*.session`, oent/adat binary chunks —
+  parser in `recorder.py`): real file path, artist/title, deck, unix start/end.
+  Serato flushes entries on track eject and on quit, so the last track can land
+  late — the ⟳ rescan button re-parses and rewrites the crate.
+- On stop, played tracks are written as a Serato crate
+  `~/Music/_Serato_/Subcrates/DJ Dwrek%%<set name>.crate` (paths that still exist
+  only). Serato shows it after restart. No matching/Shazam needed — these are the
+  exact files played.
+- Replay: `/api/recorder/recordings/<id>/events` compacts the raw stream into
+  gestures (notes = presses, CC runs within 250ms coalesce); the arena page plays
+  them back Mortal-Kombat-style — jogs spin, pads A/B/X/Y flash, crossfader slides,
+  combo chip feed scrolls. Deep link: `/recorder?replay=<id>&t=<s>&play=1`.
+- DDJ-SB3 map (confirmed by live wiretap 2026-07-15, 1-based channels): crossfader
+  ch7 cc31 (+cc63 LSB), EQ ch5/ch6 cc2/4/6 (+34/36/38 LSBs), jog ch1/ch2 cc34-35 +
+  touch note54, play note11, pads ch8/ch9, FX ch11/ch12.
+- `recordings/` is gitignored (personal set data).
+
 ## Quick start
 - Server: `cd /Users/djsly/setlist && source .venv/bin/activate && python server.py &`
 - URL: http://localhost:8787

@@ -26,6 +26,8 @@ from pathlib import Path
 
 from flask import Flask, jsonify, request, send_from_directory
 
+import recorder
+
 PORT = 8787
 AMAPIANO = "http://localhost:8766"
 BASE = Path(__file__).parent
@@ -1216,6 +1218,55 @@ def job_status(job_id):
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify(job)
+
+
+# ── djdreck set recorder (MIDI wiretap + Serato history → crate) ──
+
+@app.route("/recorder")
+def recorder_page():
+    return send_from_directory(BASE / "public", "recorder.html")
+
+
+@app.route("/api/recorder/start", methods=["POST"])
+def recorder_start():
+    data = request.json or {}
+    res = recorder.start(data.get("name", "").strip(), data.get("port", "DDJ"))
+    return jsonify(res), 409 if res.get("error") else 200
+
+
+@app.route("/api/recorder/stop", methods=["POST"])
+def recorder_stop():
+    res = recorder.stop()
+    return jsonify(res), 409 if res.get("error") else 200
+
+
+@app.route("/api/recorder/status")
+def recorder_status():
+    return jsonify(recorder.status())
+
+
+@app.route("/api/recorder/recordings")
+def recorder_list():
+    return jsonify({"recordings": recorder.list_recordings()})
+
+
+@app.route("/api/recorder/recordings/<rid>")
+def recorder_get(rid):
+    rec = recorder.get_recording(rid)
+    if not rec:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(rec)
+
+
+@app.route("/api/recorder/recordings/<rid>/events")
+def recorder_events(rid):
+    return jsonify({"gestures": recorder.gestures(rid)})
+
+
+@app.route("/api/recorder/recordings/<rid>/rescan", methods=["POST"])
+def recorder_rescan(rid):
+    res = recorder.rescan(rid)
+    return jsonify(res), 404 if res.get("error") else 200
 
 
 if __name__ == "__main__":
