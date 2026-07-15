@@ -830,16 +830,24 @@ def _spotify_auth_listener(state):
         def do_GET(self):
             qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             code = (qs.get("code") or [None])[0]
-            ok = bool(code) and (qs.get("state") or [None])[0] == state
-            if ok:
+            err = (qs.get("error") or [None])[0]
+            # Only a genuine callback for THIS attempt ends the listener;
+            # favicon fetches, stale tabs, and old-state callbacks get a 404
+            # so a stray hit can't burn the one-shot server.
+            if (qs.get("state") or [None])[0] != state or not (code or err):
+                self.send_response(404)
+                self.end_headers()
+                return
+            if err:
+                _sp_user["error"] = err
+                msg = f"Spotify auth failed: {err}"
+            else:
                 try:
                     _spotify_exchange(code)
                     msg = "Spotify connected — close this tab and go back to Setlist."
                 except Exception as e:
                     _sp_user["error"] = str(e)[:200]
                     msg = f"Spotify auth failed: {_sp_user['error']}"
-            else:
-                msg = "Spotify auth failed (denied or bad state)."
             self.send_response(200)
             self.send_header("Content-Type", "text/html")
             self.end_headers()
@@ -852,9 +860,14 @@ def _spotify_auth_listener(state):
             pass
 
     try:
-        HTTPServer(("127.0.0.1", 8800), Handler).serve_forever()
+        srv = HTTPServer(("127.0.0.1", 8800), Handler)
     except OSError as e:
         _sp_user["error"] = f"port 8800 busy: {e}"
+        return
+    # Give up after 10 minutes so an abandoned attempt doesn't hold 8800
+    # hostage for the next one.
+    threading.Timer(600, srv.shutdown).start()
+    srv.serve_forever()
 
 
 @app.route("/api/spotify/status")
