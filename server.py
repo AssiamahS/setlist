@@ -181,23 +181,44 @@ def make_track(name, n):
     return {"n": n, "name": name, "artist": artist, "title": title, "unknown": is_id}
 
 
-CUE_PREFIX_RE = re.compile(r"^\s*(?:[\d]+[.):]|\[?\d{1,2}:\d{2}(?::\d{2})?\]?|[•*>▶︎♪-])*\s*")
+# timestamp alternative MUST come first: ordered alternation otherwise lets
+# `\d+[.):]` eat the "0:" out of "0:00" and the cue time is lost
+CUE_PREFIX_RE = re.compile(r"^\s*(?:\[?\d{1,2}:\d{2}(?::\d{2})?\]?|[\d]+[.):]|[•*>▶︎♪-])*\s*")
+TS_RE = re.compile(r"(?<![\d:])(\d{1,2}):(\d{2})(?::(\d{2}))?(?![\d:])")
+
+
+def ts_seconds(m):
+    a, b, c = m.groups()
+    if c is not None:
+        return int(a) * 3600 + int(b) * 60 + int(c)
+    return int(a) * 60 + int(b)
 
 
 def tracks_from_lines(lines):
     """'Artist - Title' tracks from free-form lines (descriptions, chapters,
-    comments, pasted text). Strips leading timestamps/numbering/bullets and
-    normalizes en/em dashes."""
+    comments, pasted text). Keeps the cue timestamp (leading '23:10 Artist -
+    Title' or trailing 'Artist - Title 23:10') as t seconds, strips
+    numbering/bullets and normalizes en/em dashes."""
     tracks, seen = [], set()
     for line in lines:
         line = re.sub(r"\s+[–—]\s+", " - ", line)
-        line = CUE_PREFIX_RE.sub("", line).strip()
+        prefix = CUE_PREFIX_RE.match(line).group(0)
+        m = TS_RE.search(prefix)
+        line = line[len(prefix):].strip()
+        if not m:
+            tail = TS_RE.search(line[-10:])
+            if tail and line.endswith(tail.group(0)):
+                m = tail
+                line = line[:-len(tail.group(0))].rstrip(" -–—([")
         if " - " not in line or len(line) < 6 or line.lower() in seen:
             continue
         if line.count("http") or line.count("@") > 1:
             continue  # link/social lines, not tracks
         seen.add(line.lower())
-        tracks.append(make_track(line, len(tracks) + 1))
+        track = make_track(line, len(tracks) + 1)
+        if m:
+            track["t"] = ts_seconds(m)
+        tracks.append(track)
     return tracks
 
 
@@ -280,6 +301,11 @@ def apple_album_tracks(album_url):
         track = make_track(name, len(tracks) + 1)
         track["duration_s"] = iso_duration_s(t.get("duration"))
         tracks.append(track)
+    if any(t["duration_s"] for t in tracks):
+        at = 0
+        for track in tracks:  # cumulative mix position from segment durations
+            track["t"] = at
+            at += track["duration_s"]
     if tracks:
         cache_put("am:" + album_url, {"title": title, "tracks": tracks})
     return title, tracks
@@ -303,7 +329,15 @@ def resolve_youtube(url):
     title = j.get("title") or "YouTube set"
     desc = j.get("description") or ""
 
-    tracks = tracks_from_lines(c.get("title", "") for c in j.get("chapters") or [])
+    tracks = []
+    for c in j.get("chapters") or []:
+        line = re.sub(r"\s+[–—]\s+", " - ", c.get("title", ""))
+        line = CUE_PREFIX_RE.sub("", line).strip()
+        if " - " not in line or len(line) < 6:
+            continue
+        track = make_track(line, len(tracks) + 1)
+        track["t"] = int(c.get("start_time") or 0)
+        tracks.append(track)
     source = "youtube chapters"
     if len(tracks) < 3:
         tracks, source = tracks_from_lines(desc.splitlines()), "youtube description"
@@ -517,6 +551,135 @@ def youtube_pick(artist, title, expected_s=0):
     return best
 
 
+# ── Shazam auto-tagging: sample the mix every N sec, fingerprint each clip ──
+
+# shazamio-core segfaults on this venv's Python 3.14 — recognition runs through
+# cratemate's 3.13 venv, which has a working shazamio.
+SHAZAM_PY = Path.home() / "cratemate" / ".venv" / "bin" / "python"
+AUDIO_DIR = CACHE_DIR / "audio"
+YT_ID_RE = re.compile(r"(?:v=|youtu\.be/|/shorts/|/live/)([\w-]{11})")
+
+_shz_jobs = {}
+_shz_lock = threading.Lock()
+
+
+def yt_cache_key(url):
+    m = YT_ID_RE.search(url)
+    return "shazam:" + (m.group(1) if m else url)
+
+
+def merge_shazam_samples(samples, stride):
+    """Collapse per-sample recognitions into a tracklist: consecutive samples
+    Shazam tags as the same song become one track starting at the first
+    matching sample's offset. Unrecognized samples don't break a run —
+    transitions and heavy drops often miss."""
+    tracks, last_key = [], None
+    for s in samples:
+        artist, title = s.get("artist", ""), s.get("title", "")
+        if not title:
+            continue
+        key = norm(f"{artist} {title}")
+        if key == last_key:
+            continue
+        last_key = key
+        track = make_track(f"{artist} - {title}" if artist else title, len(tracks) + 1)
+        track["t"] = s["t"]
+        tracks.append(track)
+    return tracks
+
+
+def _dl_mix_audio(url):
+    """Download (or reuse) the mix's audio, named by video id."""
+    AUDIO_DIR.mkdir(exist_ok=True)
+    m = YT_ID_RE.search(url)
+    stem = m.group(1) if m else hashlib.md5(url.encode()).hexdigest()[:12]
+    existing = list(AUDIO_DIR.glob(stem + ".*"))
+    if existing:
+        return existing[0]
+    r = subprocess.run(
+        ["yt-dlp", "-f", "bestaudio", "-o", str(AUDIO_DIR / f"{stem}.%(ext)s"),
+         "--no-playlist", url],
+        capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0:
+        raise RuntimeError((r.stderr or "yt-dlp failed").strip().split("\n")[-1][:200])
+    existing = list(AUDIO_DIR.glob(stem + ".*"))
+    if not existing:
+        raise RuntimeError("yt-dlp reported success but no audio file landed")
+    return existing[0]
+
+
+def _run_shazam(job_id):
+    with _shz_lock:
+        job = _shz_jobs[job_id]
+    url, stride = job["url"], job["stride"]
+    try:
+        if not SHAZAM_PY.exists():
+            raise RuntimeError(f"no shazamio Python at {SHAZAM_PY}")
+        try:
+            r = subprocess.run(["yt-dlp", "--print", "title", "--no-playlist", url],
+                               capture_output=True, text=True, timeout=60)
+            job["title"] = r.stdout.strip().split("\n")[0] or job["title"]
+        except Exception:
+            pass
+        job["stage"] = "downloading mix audio"
+        audio = _dl_mix_audio(url)
+        job["stage"] = "tagging"
+        samples = []
+        errlog = open(AUDIO_DIR / f"{job_id}.log", "w")
+        proc = subprocess.Popen(
+            [str(SHAZAM_PY), str(BASE / "shazam_tag.py"), str(audio), str(stride)],
+            stdout=subprocess.PIPE, stderr=errlog, text=True)
+        for line in proc.stdout:
+            try:
+                d = json.loads(line)
+            except ValueError:
+                continue
+            if d.get("done"):
+                break
+            samples.append(d)
+            job["sample"], job["samples"] = d["i"], d["total"]
+            job["tracks"] = merge_shazam_samples(samples, stride)
+        proc.wait(timeout=30)
+        errlog.close()
+        if not samples:
+            raise RuntimeError(f"tagger produced no samples — see {errlog.name}")
+        cache_put(yt_cache_key(url), {
+            "type": "tracklist", "url": url, "source": "shazam",
+            "title": job["title"], "tracks": job["tracks"]})
+        job["status"] = "done"
+    except Exception as e:
+        job["status"] = "error"
+        job["error"] = str(e)[:300]
+
+
+@app.route("/api/shazam", methods=["POST"])
+def shazam_start():
+    data = request.json or {}
+    url = (data.get("url") or "").strip()
+    if not YT_URL_RE.search(url):
+        return jsonify({"error": "YouTube URL required"}), 400
+    cached = cache_get(yt_cache_key(url))
+    if cached and not data.get("force"):
+        return jsonify({"cached": True, **cached})
+    job_id = hashlib.md5(f"shz{url}{time.time()}".encode()).hexdigest()[:10]
+    job = {"id": job_id, "url": url, "stride": int(data.get("stride") or 45),
+           "status": "running", "stage": "starting", "title": "YouTube mix",
+           "sample": 0, "samples": 0, "tracks": []}
+    with _shz_lock:
+        _shz_jobs[job_id] = job
+    threading.Thread(target=_run_shazam, args=(job_id,), daemon=True).start()
+    return jsonify({"id": job_id})
+
+
+@app.route("/api/shazam/<job_id>")
+def shazam_status(job_id):
+    with _shz_lock:
+        job = _shz_jobs.get(job_id)
+    if not job:
+        return jsonify({"error": "Not found"}), 404
+    return jsonify(job)
+
+
 # ── download jobs (feed amapiano, limited concurrency) ──
 
 _jobs = {}
@@ -544,6 +707,24 @@ def amapiano_download(url, name, meta_name=None):
 
 def amapiano_status(dl_id):
     return http_get_json(f"{AMAPIANO}/api/download/{dl_id}", timeout=10)
+
+
+def export_serato_crate(name):
+    """Ask amapiano to write a Serato .crate for the playlist it built while
+    downloading this set (playlist name == set name)."""
+    try:
+        pls = http_get_json(f"{AMAPIANO}/api/playlists", timeout=10).get("playlists", [])
+        pid = next((p["id"] for p in pls if p["name"] == name), None)
+        if not pid:
+            return {"error": f"amapiano has no playlist named {name!r}"}
+        req = urllib.request.Request(
+            f"{AMAPIANO}/api/serato/export",
+            data=json.dumps({"playlist_id": pid}).encode(),
+            headers={"Content-Type": "application/json"})
+        r = json.loads(urllib.request.urlopen(req, timeout=30).read())
+        return {"path": r.get("path"), "tracks": r.get("tracks")}
+    except Exception as e:
+        return {"error": str(e)[:200]}
 
 
 def _run_job(job_id):
@@ -590,6 +771,8 @@ def _run_job(job_id):
                 break
         else:
             item["status"] = "timeout"
+    if any(i["status"] == "done" for i in job["items"]):
+        job["crate"] = export_serato_crate(name)
     with _jobs_lock:
         job["status"] = "done"
         job["finished"] = time.time()
@@ -637,9 +820,10 @@ def resolve():
             return jsonify({"error": f"YouTube fetch failed: {e}"}), 502
         if not r["tracks"]:
             return jsonify({
-                "type": "manual_needed", "url": q,
+                "type": "manual_needed", "url": q, "can_shazam": True,
                 "reason": "No tracklist in this video's chapters, description, linked "
-                          "Apple Music album, or top comments. If you find one, use paste mode.",
+                          "Apple Music album, or top comments. Shazam-tag it below, or "
+                          "paste a tracklist if you find one.",
             })
         return jsonify(r)
 
@@ -749,7 +933,8 @@ def download():
                "name": t.get("name", ""), "spotify_url": (t.get("match") or {}).get("url"),
                "duration_s": ((t.get("match") or t.get("verified") or {}).get("duration_s")
                               or t.get("duration_s")),
-               "skip": bool(t.get("unknown")), "status": "queued",
+               "t": t.get("t"),
+               "skip": bool(t.get("unknown") or t.get("skip")), "status": "queued",
            } for t in items]}
     with _jobs_lock:
         _jobs[job_id] = job

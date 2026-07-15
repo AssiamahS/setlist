@@ -64,6 +64,14 @@
   .progress i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .4s; }
   .spin { display: inline-block; width: 12px; height: 12px; border: 2px solid var(--line); border-top-color: var(--accent); border-radius: 50%; animation: r 0.8s linear infinite; vertical-align: -2px; }
   @keyframes r { to { transform: rotate(360deg); } }
+  td.t { color: var(--dim); width: 56px; font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .rowbtns { white-space: nowrap; width: 78px; }
+  .rowbtns button { padding: 3px 9px; font-size: 12px; border-radius: 6px; margin-left: 4px; background: var(--panel2); color: var(--dim); border: 1px solid var(--line); font-weight: 600; }
+  .rowbtns button.keep { color: var(--accent); border-color: var(--accent); }
+  .rowbtns button.cutb { color: var(--red); border-color: var(--red); }
+  tr.cut td { opacity: .45; }
+  .editrow input { background: var(--panel2); border: 1px solid var(--line); color: var(--txt); border-radius: 6px; padding: 5px 8px; font-size: 13px; margin: 2px 4px 2px 0; }
+  .editrow button { padding: 5px 10px; font-size: 12px; }
 </style>
 </head>
 <body>
@@ -147,7 +155,11 @@ async function resolve(q) {
     if (r.type === "tracklist") showTracklist(r);
     else if (r.type === "dj") showDJ(r);
     else if (r.type === "manual_needed") {
-      $("#results").innerHTML = `<div class="card">This set isn't archived yet and the live page is Cloudflare-blocked.<div class="hint">${esc(r.reason)}</div></div>`;
+      $("#results").innerHTML = `<div class="card">No tracklist found for this one.<div class="hint">${esc(r.reason)}</div>` +
+        (r.can_shazam ? `<div class="toolbar"><button id="shzGo">Tag songs with Shazam</button>` +
+          `<span class="hint">downloads the mix audio and fingerprints a clip every 45s — takes a few minutes</span></div>` : "") +
+        `</div>`;
+      if (r.can_shazam) $("#shzGo").onclick = () => startShazam(r.url);
     }
   } catch (e) {
     $("#results").innerHTML = "";
@@ -178,28 +190,136 @@ function showDJ(r) {
   document.querySelectorAll(".setlink").forEach(el => el.onclick = () => resolve(el.dataset.url));
 }
 
+function fmtT(s) {
+  if (s == null) return "";
+  s = Math.max(0, Math.round(s));
+  const h = Math.floor(s / 3600), m = Math.floor(s % 3600 / 60), sec = String(s % 60).padStart(2, "0");
+  return h ? `${h}:${String(m).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+
+const track = n => current.tracks.find(x => x.n === n);
+
 function trackRow(t) {
-  return `<tr data-n="${t.n}">
+  return `<tr data-n="${t.n}" class="${t.skip ? "cut" : ""}">
     <td class="n">${t.n}</td>
-    <td><b>${esc(t.artist)}</b> — ${esc(t.title)}
+    <td class="t" id="t${t.n}">${fmtT(t.t)}</td>
+    <td id="trk${t.n}"><b>${esc(t.artist)}</b> — ${esc(t.title)}
       <div class="matchmeta" id="meta${t.n}"></div></td>
+    <td class="rowbtns">
+      <button id="cut${t.n}" class="${t.skip ? "cutb" : "keep"}" title="Yes = keep · No = fold into the next song's transition" onclick="toggleSkip(${t.n})">${t.skip ? "✗" : "✓"}</button>
+      <button title="Edit artist / title" onclick="editTrack(${t.n})">✎</button></td>
     <td class="st matching" id="st${t.n}"><span class="spin"></span></td>
   </tr>`;
 }
 
+function setMatchBadge(t) {
+  const st = $("#st" + t.n), meta = $("#meta" + t.n);
+  if (!st) return;
+  if (t.skip && !t.unknown) { st.className = "st skipped"; st.textContent = "→ transition"; return; }
+  if (t.match_status === "spotify") {
+    st.className = "st spotify"; st.textContent = "Spotify";
+    if (meta) meta.textContent = `${t.match.artist} — ${t.match.title}`;
+  } else if (t.match_status === "verified") {
+    st.className = "st verified"; st.textContent = "verified ✓";
+    if (meta) meta.textContent = `${t.verified.artist} — ${t.verified.title}`;
+  } else if (t.match_status === "id_track") {
+    st.className = "st id_track"; st.textContent = "ID — skipped";
+  } else if (t.match_status) {
+    st.className = "st youtube_fallback"; st.textContent = "YouTube fallback";
+  } else {
+    st.className = "st matching"; st.innerHTML = '<span class="spin"></span>';
+  }
+}
+
+// "No" = that tag isn't its own song, it's part of the blend — its span folds
+// into the transition, so the next kept track inherits the earliest folded start.
+function applyTransitions() {
+  let pending = null;
+  current.tracks.forEach(t => {
+    if (t.t == null && t.t_orig == null) return;
+    if (t.t_orig == null) t.t_orig = t.t;
+    if (t.skip) { t.t = t.t_orig; if (pending == null) pending = t.t_orig; }
+    else { t.t = pending != null ? Math.min(pending, t.t_orig) : t.t_orig; pending = null; }
+  });
+}
+
+function toggleSkip(n) {
+  const t = track(n);
+  if (!t || t.unknown) return;
+  t.skip = !t.skip;
+  applyTransitions();
+  current.tracks.forEach(x => {
+    const tr = document.querySelector(`tr[data-n="${x.n}"]`);
+    if (!tr) return;
+    tr.classList.toggle("cut", !!x.skip);
+    $("#t" + x.n).textContent = fmtT(x.t);
+    const b = $("#cut" + x.n);
+    b.textContent = x.skip ? "✗" : "✓";
+    b.className = x.skip ? "cutb" : "keep";
+    setMatchBadge(x);
+  });
+  updateDlBtn();
+}
+
+function redrawTrackCell(t) {
+  $("#trk" + t.n).innerHTML = `<b>${esc(t.artist)}</b> — ${esc(t.title)}<div class="matchmeta" id="meta${t.n}"></div>`;
+  setMatchBadge(t);
+}
+
+function editTrack(n) {
+  const t = track(n);
+  $("#trk" + n).innerHTML = `<span class="editrow">
+    <input id="ea${n}" value="${esc(t.artist)}" placeholder="Artist" style="width:160px">
+    <input id="et${n}" value="${esc(t.title)}" placeholder="Title" style="width:200px">
+    <button onclick="saveEdit(${n})">Save</button>
+    <button class="ghost" onclick="cancelEdit(${n})">Cancel</button></span>`;
+  $("#et" + n).addEventListener("keydown", e => { if (e.key === "Enter") saveEdit(n); });
+  $("#ea" + n).focus();
+}
+
+function cancelEdit(n) { redrawTrackCell(track(n)); }
+
+async function saveEdit(n) {
+  const t = track(n);
+  const artist = $("#ea" + n).value.trim(), title = $("#et" + n).value.trim();
+  if (!title) return;
+  t.artist = artist; t.title = title;
+  t.name = artist ? `${artist} - ${title}` : title;
+  t.unknown = false; t.skip = false; t.match = null; t.verified = null; t.match_status = "";
+  redrawTrackCell(t);
+  try {
+    const res = await api("/api/match", {tracks: [t]});
+    Object.assign(t, res.tracks[0]);
+  } catch (e) { t.match_status = "youtube_fallback"; }
+  setMatchBadge(t);
+  updateDlBtn();
+}
+
+function updateDlBtn() {
+  const btn = $("#dlBtn");
+  if (!btn || btn.dataset.locked || !current.matched) return;
+  const n = current.tracks.filter(t => !t.unknown && !t.skip).length;
+  btn.textContent = `Download ${n} tracks`;
+  btn.disabled = !n;
+}
+
 async function showTracklist(r) {
   current = r;
+  const isYT = /youtu\.?be/i.test(r.url || "");
   $("#results").innerHTML = `<div class="card">
     <span class="settitle">${esc(r.title)}</span>
     <span class="badge">${esc(r.source)}</span>
     <span class="badge">${r.tracks.length} tracks</span>
-    <table><thead><tr><th>#</th><th>Track</th><th>Status</th></tr></thead>
+    ${isYT ? `<button class="ghost" id="shzBtn" style="float:right;padding:6px 12px;font-size:12.5px">${r.source === "shazam" ? "Re-run Shazam" : "Shazam tag (timestamps)"}</button>` : ""}
+    <table><thead><tr><th>#</th><th>Time</th><th>Track</th><th>Yes / No</th><th>Status</th></tr></thead>
     <tbody>${r.tracks.map(trackRow).join("")}</tbody></table>
     <div class="toolbar">
+      <input type="text" id="setName" value="${esc(r.title)}" title="Folder + Serato crate name" style="flex:0 1 260px">
       <button id="dlBtn" disabled>Matching…</button>
       <div class="progress"><i id="bar"></i></div>
       <span class="hint" id="jobTxt"></span>
     </div></div>`;
+  if (isYT) $("#shzBtn").onclick = () => startShazam(r.url, r.source === "shazam");
 
   // match in batches of 8
   const matched = [];
@@ -207,41 +327,29 @@ async function showTracklist(r) {
     const batch = r.tracks.slice(i, i + 8);
     try {
       const res = await api("/api/match", {tracks: batch});
-      res.tracks.forEach(t => {
-        matched.push(t);
-        const st = $("#st" + t.n), meta = $("#meta" + t.n);
-        if (t.match_status === "spotify") {
-          st.className = "st spotify"; st.textContent = "Spotify";
-          meta.textContent = `${t.match.artist} — ${t.match.title}`;
-        } else if (t.match_status === "verified") {
-          st.className = "st verified"; st.textContent = "verified ✓";
-          meta.textContent = `${t.verified.artist} — ${t.verified.title}`;
-        } else if (t.match_status === "id_track") {
-          st.className = "st id_track"; st.textContent = "ID — skipped";
-        } else {
-          st.className = "st youtube_fallback"; st.textContent = "YouTube fallback";
-        }
-      });
+      res.tracks.forEach(t => { matched.push(t); setMatchBadge(t); });
     } catch (e) {
-      batch.forEach(t => { matched.push({...t, match: null, match_status: "youtube_fallback"});
-        const st = $("#st" + t.n); st.className = "st youtube_fallback"; st.textContent = "YouTube fallback"; });
+      batch.forEach(t => {
+        const f = {...t, match: null, match_status: "youtube_fallback"};
+        matched.push(f); setMatchBadge(f);
+      });
     }
   }
   current.tracks = matched;
-  const dlable = matched.filter(t => !t.unknown).length;
-  const btn = $("#dlBtn");
-  btn.textContent = `Download ${dlable} tracks`;
-  btn.disabled = !dlable;
-  btn.onclick = startDownload;
+  current.matched = true;
+  $("#dlBtn").onclick = startDownload;
+  updateDlBtn();
 }
 
 async function startDownload() {
   const btn = $("#dlBtn");
-  btn.disabled = true; btn.textContent = "Downloading…";
+  btn.disabled = true; btn.dataset.locked = "1"; btn.textContent = "Downloading…";
+  const name = ($("#setName").value || current.title || "Setlist").trim();
   try {
-    const job = await api("/api/download", {name: current.title, tracks: current.tracks});
+    const job = await api("/api/download", {name, tracks: current.tracks});
     pollJob(job.id);
   } catch (e) {
+    delete btn.dataset.locked;
     btn.disabled = false; btn.textContent = "Retry download";
     $("#jobTxt").textContent = e.message;
   }
@@ -257,9 +365,10 @@ async function pollJob(id) {
         if (!st) return;
         if (["done","error","not_found","timeout","skipped"].includes(it.status)) done++;
         if (it.status === "queued") return; // keep match badge until it starts
+        if (it.status === "skipped") return; // keep the "→ transition" badge
         st.className = "st " + it.status;
         st.textContent = {downloading: "downloading…", done: "✓ downloaded", error: "failed",
-                          not_found: "not found", timeout: "timeout", skipped: "skipped"}[it.status] || it.status;
+                          not_found: "not found", timeout: "timeout"}[it.status] || it.status;
         if (it.error) $("#meta" + it.n).textContent = it.error;
         else if (it.source === "youtube" && it.status === "done") $("#meta" + it.n).textContent += " (via YouTube)";
       });
@@ -269,9 +378,43 @@ async function pollJob(id) {
         clearInterval(t);
         const ok = job.items.filter(i => i.status === "done").length;
         $("#dlBtn").textContent = `Done — ${ok}/${job.items.length} in library`;
+        if (job.crate) $("#jobTxt").textContent = job.crate.path
+          ? `Serato crate ✓ (${job.crate.tracks} tracks)`
+          : `crate failed: ${job.crate.error}`;
       }
     } catch (e) { clearInterval(t); }
   }, 2500);
+}
+
+// ── Shazam tagging (for mixes with no posted tracklist, or to get timestamps) ──
+
+async function startShazam(url, force) {
+  $("#results").innerHTML = `<div class="card"><span class="spin"></span> <span id="shzTxt">Starting Shazam tagging…</span>
+    <div class="progress" style="margin-top:12px"><i id="shzBar"></i></div>
+    <div class="matchmeta" id="shzFound" style="margin-top:10px"></div></div>`;
+  try {
+    const r = await api("/api/shazam", {url, force: !!force});
+    if (r.cached) return showTracklist(r);
+    pollShazam(r.id);
+  } catch (e) { $("#results").innerHTML = `<div class="card"><span class="err">${esc(e.message)}</span></div>`; }
+}
+
+function pollShazam(id) {
+  const iv = setInterval(async () => {
+    try {
+      const j = await api("/api/shazam/" + id);
+      if (j.status === "error") { clearInterval(iv); $("#shzTxt").textContent = "Shazam tagging failed: " + j.error; return; }
+      $("#shzTxt").textContent = j.stage === "tagging"
+        ? `Fingerprinting… sample ${j.sample}/${j.samples} — ${j.tracks.length} songs so far`
+        : (j.stage || "working") + "…";
+      if (j.samples) $("#shzBar").style.width = (100 * j.sample / j.samples) + "%";
+      $("#shzFound").innerHTML = j.tracks.map(t => `${fmtT(t.t)} &nbsp;${esc(t.artist)} — ${esc(t.title)}`).join("<br>");
+      if (j.status === "done") {
+        clearInterval(iv);
+        showTracklist({type: "tracklist", url: j.url, source: "shazam", title: j.title, tracks: j.tracks});
+      }
+    } catch (e) { clearInterval(iv); }
+  }, 2000);
 }
 
 // bookmarklet round-trip
