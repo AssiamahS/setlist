@@ -88,7 +88,7 @@
 
   <div class="card" id="urlCard">
     <div class="row">
-      <input type="text" id="urlInput" placeholder="1001tracklists / YouTube set / Apple Music album URL — or just a DJ name" spellcheck="false">
+      <input type="text" id="urlInput" placeholder="1001tracklists / YouTube set / Apple Music / Instagram reel / TikTok URL — or a DJ name" spellcheck="false">
       <button id="goBtn">Pull tracks</button>
     </div>
     <div class="hint">
@@ -156,6 +156,8 @@ async function resolve(q) {
     else if (r.type === "dj") showDJ(r);
     else if (r.type === "manual_needed") {
       $("#results").innerHTML = `<div class="card">No tracklist found for this one.<div class="hint">${esc(r.reason)}</div>` +
+        (r.tl_url ? `<div class="hint" style="margin-top:8px">Found its 1001tracklists page but Cloudflare blocks it server-side — ` +
+          `<a href="${esc(r.tl_url)}" target="_blank">open it</a> and click your <b>Setlist grab</b> bookmarklet.</div>` : "") +
         (r.can_shazam ? `<div class="toolbar"><button id="shzGo">Tag songs with Shazam</button>` +
           `<span class="hint">downloads the mix audio and fingerprints a clip every 45s — takes a few minutes</span></div>` : "") +
         `</div>`;
@@ -314,8 +316,9 @@ async function showTracklist(r) {
     <table><thead><tr><th>#</th><th>Time</th><th>Track</th><th>Yes / No</th><th>Status</th></tr></thead>
     <tbody>${r.tracks.map(trackRow).join("")}</tbody></table>
     <div class="toolbar">
-      <input type="text" id="setName" value="${esc(r.title)}" title="Folder + Serato crate name" style="flex:0 1 260px">
+      <input type="text" id="setName" value="${esc(r.title)}" title="Folder + Serato crate + Spotify playlist name" style="flex:0 1 240px">
       <button id="dlBtn" disabled>Matching…</button>
+      <button class="ghost" id="spBtn" title="Create this set as a private playlist in your Spotify">→ Spotify</button>
       <div class="progress"><i id="bar"></i></div>
       <span class="hint" id="jobTxt"></span>
     </div></div>`;
@@ -338,7 +341,36 @@ async function showTracklist(r) {
   current.tracks = matched;
   current.matched = true;
   $("#dlBtn").onclick = startDownload;
+  $("#spBtn").onclick = spotifyExport;
   updateDlBtn();
+}
+
+async function spotifyExport() {
+  const btn = $("#spBtn");
+  btn.disabled = true; btn.textContent = "Spotify…";
+  const name = ($("#setName")?.value || current.title || "Setlist").trim();
+  try {
+    let st = await api("/api/spotify/status");
+    if (!st.connected) {
+      const c = await api("/api/spotify/connect", {});
+      window.open(c.auth_url, "_blank");
+      btn.textContent = "approve in browser…";
+      for (let i = 0; i < 90 && !st.connected; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        st = await api("/api/spotify/status");
+        if (st.error) throw new Error(st.error);
+      }
+      if (!st.connected) throw new Error("Spotify auth timed out");
+    }
+    const r = await api("/api/spotify/playlist", {name, tracks: current.tracks});
+    btn.textContent = `✓ Spotify (${r.added})`;
+    btn.disabled = false;
+    $("#jobTxt").innerHTML = `<a href="${r.url}" target="_blank" style="color:var(--accent)">open playlist</a>` +
+      (r.missed.length ? ` · ${r.missed.length} not on Spotify` : "");
+  } catch (e) {
+    btn.disabled = false; btn.textContent = "→ Spotify";
+    $("#jobTxt").textContent = e.message;
+  }
 }
 
 async function startDownload() {

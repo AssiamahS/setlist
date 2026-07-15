@@ -194,6 +194,12 @@ def ts_seconds(m):
     return int(a) * 60 + int(b)
 
 
+# description boilerplate that em-dash-normalizes into fake "Artist - Title" lines
+JUNK_RE = re.compile(
+    r"warning|epilepsy|strobe|subscribe|disclaimer|copyright|fair use|monetize|"
+    r"follow me|linktr\.ee|patreon|discord|tickets|merch|filmed with|playlist tab", re.I)
+
+
 def tracks_from_lines(lines):
     """'Artist - Title' tracks from free-form lines (descriptions, chapters,
     comments, pasted text). Keeps the cue timestamp (leading '23:10 Artist -
@@ -201,6 +207,8 @@ def tracks_from_lines(lines):
     numbering/bullets and normalizes en/em dashes."""
     tracks, seen = [], set()
     for line in lines:
+        if JUNK_RE.search(line) or len(line) > 120:
+            continue
         line = re.sub(r"\s+[–—]\s+", " - ", line)
         prefix = CUE_PREFIX_RE.match(line).group(0)
         m = TS_RE.search(prefix)
@@ -346,6 +354,11 @@ def resolve_youtube(url):
         if am:
             am_title, tracks = apple_album_tracks(am.group(0).rstrip(").,"))
             source = "apple music mix album"
+    tl_url = None
+    if len(tracks) < 3:
+        tl_source, tl_tracks, tl_url = tl_lookup_by_title(title)
+        if tl_tracks:
+            tracks, source = tl_tracks, tl_source
     if len(tracks) < 3:
         try:
             jc = ytdlp_json(url, comments=True)
@@ -357,7 +370,74 @@ def resolve_youtube(url):
         except Exception as e:
             print(f"[youtube] comments fetch failed: {e}", flush=True)
     return {"type": "tracklist", "url": url, "source": source,
-            "title": title, "tracks": tracks}
+            "title": title, "tracks": tracks, "tl_url": tl_url}
+
+
+# ── find a set's 1001tracklists page by searching its title ──
+# Fan uploads often have no tracklist while 1001TL has the full moderated one.
+
+SEARCH_ENGINES = [
+    "https://html.duckduckgo.com/html/?q={q}",
+    "https://www.bing.com/search?q={q}",
+    "https://www.mojeek.com/search?q={q}",
+]
+SLUG_STOPWORDS = {"the", "dj", "set", "live", "mix", "at", "and", "of", "in", "for"}
+TITLE_NOISE_RE = re.compile(
+    r"[\[(][^\])]*[\])]|full set|60fps|4k\b|hd\b|live stream|official|debut", re.I)
+
+
+def search_tracklist_urls(query):
+    """1001tracklists tracklist URLs for a free-text query, via whichever HTML
+    search engine isn't currently challenge-walling us. Only hits are cached —
+    a miss is usually an engine block, not proof the set isn't listed."""
+    key = "tlsearch:" + query.lower()
+    cached = cache_get(key, max_age=7 * 24 * 3600)
+    if cached is not None:
+        return cached
+    q = urllib.parse.quote(f"site:1001tracklists.com {query}")
+    found = []
+    for tpl in SEARCH_ENGINES:
+        try:
+            page = http_get(tpl.format(q=q), timeout=20)
+        except Exception:
+            continue
+        for chunk in (urllib.parse.unquote(page), page):
+            for m in TL_URL_RE.finditer(chunk):
+                tlid, slug = m.groups()
+                if all(f["id"] != tlid for f in found):
+                    found.append({
+                        "id": tlid, "slug": slug,
+                        "url": f"https://www.1001tracklists.com/tracklist/{tlid}/{slug}.html"})
+        if found:
+            break
+        time.sleep(1)
+    if found:
+        cache_put(key, found)
+    return found
+
+
+def tl_lookup_by_title(title):
+    """(source, tracks, found_url) for a set found on 1001tracklists by title
+    search. found_url is set even when the page itself couldn't be fetched
+    (Turnstile + not archived) so the UI can offer the bookmarklet route."""
+    q = TITLE_NOISE_RE.sub(" ", title)
+    words = re.sub(r"[^\w\s&'-]", " ", q).split()[:8]
+    if len(words) < 2:
+        return None, [], None
+    title_tokens = set(re.findall(r"[a-z0-9]+", " ".join(words).lower())) - SLUG_STOPWORDS
+    found_url = None
+    for hit in search_tracklist_urls(" ".join(words))[:3]:
+        slug_tokens = set(hit["slug"].split("-")) - SLUG_STOPWORDS
+        if len(title_tokens & slug_tokens) < 2:
+            continue  # different set entirely
+        found_url = found_url or hit["url"]
+        html, source = fetch_page(hit["url"])
+        if not html:
+            continue
+        tracks = parse_tracks(html)
+        if len(tracks) >= 3:
+            return f"1001tracklists ({source})", tracks, hit["url"]
+    return None, [], found_url
 
 
 # ── DJ set discovery: DuckDuckGo (fresh) + archived DJ page (history) ──
@@ -596,10 +676,13 @@ def _dl_mix_audio(url):
     existing = list(AUDIO_DIR.glob(stem + ".*"))
     if existing:
         return existing[0]
-    r = subprocess.run(
-        ["yt-dlp", "-f", "bestaudio", "-o", str(AUDIO_DIR / f"{stem}.%(ext)s"),
-         "--no-playlist", url],
-        capture_output=True, text=True, timeout=1800)
+    cmd = ["yt-dlp", "-f", "bestaudio/best", "-o", str(AUDIO_DIR / f"{stem}.%(ext)s"),
+           "--no-playlist", url]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
+    if r.returncode != 0 and re.search(r"instagram|tiktok|facebook", url, re.I):
+        # login-walled platforms: retry with the user's browser session
+        r = subprocess.run(cmd[:1] + ["--cookies-from-browser", "chrome"] + cmd[1:],
+                           capture_output=True, text=True, timeout=1800)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "yt-dlp failed").strip().split("\n")[-1][:200])
     existing = list(AUDIO_DIR.glob(stem + ".*"))
@@ -656,8 +739,8 @@ def _run_shazam(job_id):
 def shazam_start():
     data = request.json or {}
     url = (data.get("url") or "").strip()
-    if not YT_URL_RE.search(url):
-        return jsonify({"error": "YouTube URL required"}), 400
+    if not url.startswith("http"):
+        return jsonify({"error": "a URL yt-dlp can fetch is required"}), 400
     cached = cache_get(yt_cache_key(url))
     if cached and not data.get("force"):
         return jsonify({"cached": True, **cached})
@@ -678,6 +761,167 @@ def shazam_status(job_id):
     if not job:
         return jsonify({"error": "Not found"}), 404
     return jsonify(job)
+
+
+# ── Spotify playlist export (user OAuth through the shared spotdl app) ──
+# The spotdl app whitelists http://127.0.0.1:8800/ (its user-auth port), so we
+# run our one-shot OAuth listener there.
+
+SPOTIFY_TOKEN_FILE = BASE / "spotify_token.json"
+SPOTIFY_REDIRECT = "http://127.0.0.1:8800/"
+SPOTIFY_SCOPES = "playlist-modify-private playlist-modify-public"
+_sp_user = {"error": None}
+
+
+def _spotify_token_request(params):
+    import base64
+    auth = base64.b64encode(f"{SPOTIFY_ID}:{SPOTIFY_SECRET}".encode()).decode()
+    req = urllib.request.Request(
+        "https://accounts.spotify.com/api/token",
+        data=urllib.parse.urlencode(params).encode(),
+        headers={"Authorization": f"Basic {auth}",
+                 "Content-Type": "application/x-www-form-urlencoded"})
+    return json.loads(urllib.request.urlopen(req, timeout=15).read())
+
+
+def _spotify_exchange(code):
+    resp = _spotify_token_request({
+        "grant_type": "authorization_code", "code": code,
+        "redirect_uri": SPOTIFY_REDIRECT})
+    resp["expires_at"] = time.time() + resp.get("expires_in", 3600)
+    json.dump(resp, open(SPOTIFY_TOKEN_FILE, "w"))
+
+
+def sp_user_token():
+    """Valid user access token, refreshing when stale, or None."""
+    try:
+        tok = json.load(open(SPOTIFY_TOKEN_FILE))
+    except Exception:
+        return None
+    if time.time() < tok.get("expires_at", 0) - 30:
+        return tok["access_token"]
+    try:
+        resp = _spotify_token_request({
+            "grant_type": "refresh_token", "refresh_token": tok["refresh_token"]})
+    except Exception as e:
+        print(f"[spotify] refresh failed: {e}", flush=True)
+        return None
+    tok["access_token"] = resp["access_token"]
+    tok["expires_at"] = time.time() + resp.get("expires_in", 3600)
+    tok["refresh_token"] = resp.get("refresh_token") or tok["refresh_token"]
+    json.dump(tok, open(SPOTIFY_TOKEN_FILE, "w"))
+    return tok["access_token"]
+
+
+def sp_api(method, path, token, body=None):
+    req = urllib.request.Request(
+        "https://api.spotify.com/v1" + path,
+        data=json.dumps(body).encode() if body is not None else None,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": "application/json"},
+        method=method)
+    return json.loads(urllib.request.urlopen(req, timeout=20).read() or b"{}")
+
+
+def _spotify_auth_listener(state):
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            qs = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            code = (qs.get("code") or [None])[0]
+            ok = bool(code) and (qs.get("state") or [None])[0] == state
+            if ok:
+                try:
+                    _spotify_exchange(code)
+                    msg = "Spotify connected — close this tab and go back to Setlist."
+                except Exception as e:
+                    _sp_user["error"] = str(e)[:200]
+                    msg = f"Spotify auth failed: {_sp_user['error']}"
+            else:
+                msg = "Spotify auth failed (denied or bad state)."
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html")
+            self.end_headers()
+            self.wfile.write(("<body style='background:#0c0e12;color:#e8eaee;"
+                              "font:16px -apple-system;padding:40px'>"
+                              + msg + "</body>").encode())
+            threading.Thread(target=self.server.shutdown, daemon=True).start()
+
+        def log_message(self, *a):
+            pass
+
+    try:
+        HTTPServer(("127.0.0.1", 8800), Handler).serve_forever()
+    except OSError as e:
+        _sp_user["error"] = f"port 8800 busy: {e}"
+
+
+@app.route("/api/spotify/status")
+def spotify_status():
+    tok = sp_user_token()
+    if not tok:
+        err, _sp_user["error"] = _sp_user["error"], None
+        return jsonify({"connected": False, "error": err})
+    try:
+        me = sp_api("GET", "/me", tok)
+        return jsonify({"connected": True, "user": me.get("display_name") or me.get("id")})
+    except Exception as e:
+        return jsonify({"connected": False, "error": str(e)[:120]})
+
+
+@app.route("/api/spotify/connect", methods=["POST"])
+def spotify_connect():
+    state = hashlib.md5(f"{time.time()}".encode()).hexdigest()[:12]
+    _sp_user["error"] = None
+    threading.Thread(target=_spotify_auth_listener, args=(state,), daemon=True).start()
+    url = "https://accounts.spotify.com/authorize?" + urllib.parse.urlencode({
+        "client_id": SPOTIFY_ID, "response_type": "code",
+        "redirect_uri": SPOTIFY_REDIRECT, "scope": SPOTIFY_SCOPES, "state": state})
+    return jsonify({"auth_url": url})
+
+
+@app.route("/api/spotify/playlist", methods=["POST"])
+def spotify_playlist():
+    data = request.json or {}
+    name = (data.get("name") or "Setlist").strip()
+    items = [t for t in data.get("tracks", []) if not t.get("unknown") and not t.get("skip")]
+    if not items:
+        return jsonify({"error": "no tracks"}), 400
+    tok = sp_user_token()
+    if not tok:
+        return jsonify({"error": "not connected", "need_auth": True}), 401
+    uris, missed = [], []
+    for t in items:
+        m = re.search(r"open\.spotify\.com/track/([A-Za-z0-9]+)",
+                      (t.get("match") or {}).get("url") or "")
+        if m:
+            uris.append("spotify:track:" + m.group(1))
+            continue
+        try:  # not matched at resolve time — search on the user token
+            q = urllib.parse.quote(f"{t.get('artist', '')} {t.get('title', '')}".strip())
+            res = sp_api("GET", f"/search?type=track&limit=3&q={q}", tok)
+            best, best_score = None, 0.0
+            for it in res.get("tracks", {}).get("items", []):
+                s = score_pair(t.get("artist", ""), t.get("title", ""),
+                               ", ".join(a["name"] for a in it["artists"]), it["name"])
+                if s > best_score:
+                    best, best_score = it, s
+            if best and best_score >= MATCH_THRESHOLD:
+                uris.append(best["uri"])
+            else:
+                missed.append(t.get("name") or t.get("title") or "?")
+        except Exception:
+            missed.append(t.get("name") or t.get("title") or "?")
+    if not uris:
+        return jsonify({"error": "no Spotify matches to add", "missed": missed}), 422
+    me = sp_api("GET", "/me", tok)
+    pl = sp_api("POST", f"/users/{me['id']}/playlists", tok,
+                {"name": name, "public": False, "description": "made with setlist"})
+    for i in range(0, len(uris), 100):
+        sp_api("POST", f"/playlists/{pl['id']}/tracks", tok, {"uris": uris[i:i + 100]})
+    return jsonify({"url": pl["external_urls"]["spotify"],
+                    "added": len(uris), "missed": missed})
 
 
 # ── download jobs (feed amapiano, limited concurrency) ──
@@ -818,12 +1062,13 @@ def resolve():
             r = resolve_youtube(q)
         except Exception as e:
             return jsonify({"error": f"YouTube fetch failed: {e}"}), 502
-        if not r["tracks"]:
+        if len(r["tracks"]) < 3:
             return jsonify({
                 "type": "manual_needed", "url": q, "can_shazam": True,
-                "reason": "No tracklist in this video's chapters, description, linked "
-                          "Apple Music album, or top comments. Shazam-tag it below, or "
-                          "paste a tracklist if you find one.",
+                "tl_url": r.get("tl_url"),
+                "reason": "No readable tracklist in this video's chapters, description, "
+                          "linked Apple Music album, 1001tracklists, or top comments. "
+                          "Shazam-tag it below, or paste a tracklist if you find one.",
             })
         return jsonify(r)
 
@@ -859,6 +1104,15 @@ def resolve():
                                      "title": title, "date": date, "archived": ""})
         sets.sort(key=lambda s: s["date"], reverse=True)
         return jsonify({"type": "dj", "name": name, "sets": sets})
+
+    if q.startswith("http"):
+        # Instagram reel, TikTok, SoundCloud… — no tracklist to read, but the
+        # audio itself is taggable
+        return jsonify({
+            "type": "manual_needed", "url": q, "can_shazam": True,
+            "reason": "No tracklist source for this link — Shazam the audio instead "
+                      "(works for Instagram reels, TikToks, SoundCloud, anything yt-dlp can reach).",
+        })
 
     return jsonify({"error": "Drop a 1001tracklists tracklist/DJ URL, a YouTube set, "
                     "an Apple Music album, or a DJ name"}), 400

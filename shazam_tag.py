@@ -30,7 +30,10 @@ async def main():
     audio = sys.argv[1]
     stride = int(sys.argv[2]) if len(sys.argv) > 2 else 45
     clip = int(sys.argv[3]) if len(sys.argv) > 3 else 10
-    offsets = list(range(0, max(int(duration_s(audio)) - clip, 1), stride))
+    dur = int(duration_s(audio))
+    if dur < stride * 4:  # short clip (reel/TikTok): sample densely
+        stride = max(12, dur // 5 or 12)
+    offsets = list(range(0, max(dur - clip, 1), stride))
 
     from shazamio import Shazam
     sh = Shazam()
