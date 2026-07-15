@@ -369,8 +369,10 @@ async function pollJob(id) {
         st.className = "st " + it.status;
         st.textContent = {downloading: "downloading…", done: "✓ downloaded", error: "failed",
                           not_found: "not found", timeout: "timeout"}[it.status] || it.status;
-        if (it.error) $("#meta" + it.n).textContent = it.error;
-        else if (it.source === "youtube" && it.status === "done") $("#meta" + it.n).textContent += " (via YouTube)";
+        const meta = $("#meta" + it.n);
+        if (it.error) meta.textContent = it.error;
+        else if (it.source === "youtube" && it.status === "done" && !meta.textContent.includes("(via YouTube)"))
+          meta.textContent += " (via YouTube)";
       });
       $("#bar").style.width = (100 * done / job.items.length) + "%";
       $("#jobTxt").textContent = `${done}/${job.items.length}`;
